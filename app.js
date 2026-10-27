@@ -43,7 +43,7 @@ function esc(str) {
 }
 
 const ASSETS_KEY = 'tj_assets';
-const DEFAULT_ASSETS = [{ symbol: 'XAUUSD', category: 'Metals', contractSize: 100 }];
+const DEFAULT_ASSETS = [{ symbol: 'XAUUSD' }];
 
 let _assetsCache = null;
 function loadAssets() {
@@ -52,13 +52,8 @@ function loadAssets() {
   if (!stored) { _assetsCache = DEFAULT_ASSETS.slice(); return _assetsCache; }
   var parsed = JSON.parse(stored);
   _assetsCache = parsed.map(function(a) {
-    if (typeof a === 'string') {
-      if (a === 'XAUUSD') return { symbol: 'XAUUSD', category: 'Metals', contractSize: 100 };
-      if (a.includes('XAG')) return { symbol: a, category: 'Metals', contractSize: 5000 };
-      return { symbol: a, category: 'FX', contractSize: 1 };
-    }
-    if (!a.category) a.category = 'FX';
-    return { symbol: a.symbol, category: a.category, contractSize: a.contractSize || 1 };
+    if (typeof a === 'string') return { symbol: a };
+    return { symbol: a.symbol || a };
   });
   return _assetsCache;
 }
@@ -67,28 +62,13 @@ function saveAssets(list) { _assetsCache = list; localStorage.setItem(ASSETS_KEY
 const getAsset = (ticker) => {
   return loadAssets().find(function(a) { return a.symbol === (ticker || '').toUpperCase(); }) || {};
 };
-const getContractSize = (ticker) => getAsset(ticker).contractSize || 1;
 
-const CATEGORIES = ['FX', 'Indices', 'Metals', 'Oil', 'Crypto'];
-const DEFAULT_LEVERAGE = { FX: 500, Indices: 100, Metals: 100, Oil: 100, Crypto: 10 };
 
-function getAccLeverage(acc, category) {
-  var lev = acc && acc.leverageByCategory && acc.leverageByCategory[category];
-  return lev || DEFAULT_LEVERAGE[category] || 100;
-}
-
-const calcPnl = (t, accId) => {
-  const entry = +t.entryPrice || 0, exit = +t.exitPrice || 0;
-  const lots  = +t.positionSize || 0, fees = +t.fees || 0;
-  const cs    = getContractSize(t.ticker);
-  const raw   = t.position === 'Long' ? (exit - entry) * lots * cs : (entry - exit) * lots * cs;
-  return parseFloat((raw - fees).toFixed(2));
-};
 
 const calcR = (t) => {
   if (!t.stopLoss || !+t.stopLoss) return null;
   const entry = +t.entryPrice, sl = +t.stopLoss;
-  const risk  = Math.abs(entry - sl) * (+t.positionSize || 0) * getContractSize(t.ticker);
+  const risk  = Math.abs(entry - sl) * (+t.positionSize || 0);
   return risk > 0 ? parseFloat((t.pnl / risk).toFixed(2)) : null;
 };
 
@@ -153,10 +133,9 @@ function populateAssetSelect(selected) {
   var sel  = document.getElementById('fTicker');
   sel.innerHTML = list.map(function(a) {
     return '<option value="' + esc(a.symbol) + '"' + (a.symbol === selected ? ' selected' : '') + '>' +
-      esc(a.symbol) + ' (' + esc(a.category || 'FX') + ')' +
+      esc(a.symbol) +
     '</option>';
   }).join('');
-  updateLeverageInfo();
 }
 
 var addAssetBackdrop = document.getElementById('addAssetModalBackdrop');
@@ -164,10 +143,8 @@ function openAddAssetModal(asset) {
   document.getElementById('addAssetModalTitle').textContent = asset ? 'Edit Asset' : 'Add Asset';
   document.getElementById('fNewAssetSymbol').value = asset ? asset.symbol : '';
   document.getElementById('fNewAssetSymbol').readOnly = !!asset;
-  document.getElementById('fNewAssetCategory').value = asset ? (asset.category || 'FX') : 'FX';
-  document.getElementById('fNewAssetContractSize').value = asset ? (asset.contractSize || '') : '';
   addAssetBackdrop.classList.remove('hidden');
-  setTimeout(function() { document.getElementById(asset ? 'fNewAssetContractSize' : 'fNewAssetSymbol').focus(); }, 50);
+  setTimeout(function() { document.getElementById('fNewAssetSymbol').focus(); }, 50);
 }
 function closeAddAssetModal() { document.getElementById('fNewAssetSymbol').readOnly = false; addAssetBackdrop.classList.add('hidden'); }
 document.getElementById('btnCloseAddAssetModal').addEventListener('click', closeAddAssetModal);
@@ -175,13 +152,10 @@ document.getElementById('btnCancelAddAsset').addEventListener('click', closeAddA
 addAssetBackdrop.addEventListener('click', function(e) { if (e.target === addAssetBackdrop) closeAddAssetModal(); });
 document.getElementById('btnSaveAddAsset').addEventListener('click', function() {
   var sym = document.getElementById('fNewAssetSymbol').value.trim().toUpperCase();
-  var cat = document.getElementById('fNewAssetCategory').value;
-  var cs  = parseFloat(document.getElementById('fNewAssetContractSize').value);
   if (!sym) { showToast('Please enter an asset symbol.', 'error'); return; }
-  if (!cs || cs <= 0) { showToast('Please enter a valid contract size.', 'error'); return; }
   var list = loadAssets();
   var idx = list.findIndex(function(a) { return a.symbol === sym; });
-  var asset = { symbol: sym, category: cat, contractSize: cs };
+  var asset = { symbol: sym };
   if (idx >= 0) list[idx] = asset; else list.push(asset);
   saveAssets(list);
   populateAssetSelect(sym);
@@ -192,6 +166,7 @@ document.getElementById('btnAddAsset').addEventListener('click', function() {
   var existing = ticker ? getAsset(ticker) : null;
   openAddAssetModal(existing && existing.symbol ? existing : null);
 });
+
 
 // ── Screenshot helpers ────────────────────────────────────────
 function setScreenshotPreview(src) {
@@ -263,7 +238,6 @@ function switchAccountTab(tab) {
   else if (tab === 'trades') renderTrades();
   else if (tab === 'notes') renderNotes();
   else if (tab === 'withdrawals') renderWithdrawals();
-  else if (tab === 'settings') renderSettings();
 }
 
 function showScreen(name) {
@@ -295,7 +269,7 @@ function showScreen(name) {
       'Accounts</button>' +
       '<span class="account-label" style="margin-left:8px">' + accLabel + '</span>' +
       '<div style="display:flex;gap:4px;margin-left:12px">' +
-        ['dashboard','trades','notes','withdrawals','settings'].map(t =>
+        ['dashboard','trades','notes','withdrawals'].map(t =>
           '<button class="tab-btn' + (t === currentAccountTab ? ' active' : '') + '" data-accnavtab="' + t + '">' +
           t.charAt(0).toUpperCase() + t.slice(1) + '</button>'
         ).join('') +
@@ -424,10 +398,8 @@ function renderOverview() {
   Object.values(miniCharts).forEach(c => c.destroy());
   miniCharts = {};
 
-  // recalculate pnl for all trades before stats
   const allTrades = accounts.reduce((arr, a) => {
-    const t = loadTrades(a.id).map(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accId = a.id; return tr; });
-    saveTrades(a.id, t);
+    const t = loadTrades(a.id).map(function(tr) { tr._accId = a.id; return tr; });
     return arr.concat(t);
   }, []);
   const cs = accountStats(allTrades);
@@ -538,8 +510,7 @@ function renderOverview() {
 
 function openAccount(id) {
   activeAccId = id;
-  trades      = loadTrades(id).map(function(t) { t.pnl = calcPnl(t); return t; });
-  saveTrades(id, trades);
+  trades      = loadTrades(id);
   withdrawals = loadWithdrawals(id);
   filterResult = 'all'; filterAsset = ''; sortField = 'datetime'; sortDir = 'desc'; notesFilter = 'all'; calYear = 0; calMonth = 0;
   showScreen('account');
@@ -561,11 +532,11 @@ function openModal(trade) {
   document.getElementById('fSize').value     = trade ? trade.positionSize : '';
   document.getElementById('fFees').value     = trade ? trade.fees         : '0';
   document.getElementById('fStopLoss').value = trade ? (trade.stopLoss || '') : '';
+  document.getElementById('fPnl').value      = trade ? trade.pnl : '';
   document.getElementById('fTags').value     = trade ? trade.tags         : '';
   document.getElementById('fNotes').value    = trade ? trade.notes        : '';
   currentScreenshot = (trade && trade.screenshot) ? trade.screenshot : null;
   setScreenshotPreview(currentScreenshot);
-  updatePnlPreview();
   backdrop.classList.remove('hidden');
 }
 
@@ -580,38 +551,7 @@ document.getElementById('btnCloseModal').addEventListener('click', closeModal);
 document.getElementById('btnCancelForm').addEventListener('click', closeModal);
 backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(); });
 
-function updateLeverageInfo() {
-  var ticker = document.getElementById('fTicker').value;
-  var asset = getAsset(ticker);
-  var acc = accounts.find(function(a) { return a.id === activeAccId; }) || {};
-  var lev = getAccLeverage(acc, asset.category || 'FX');
-  var el = document.getElementById('leverageInfo');
-  if (el) el.textContent = asset.category ? asset.category + ' · Leverage 1:' + lev : '';
-}
 
-function updatePnlPreview() {
-  const draft = {
-    ticker: document.getElementById('fTicker').value,
-    position: document.getElementById('fPosition').value,
-    entryPrice: document.getElementById('fEntry').value,
-    exitPrice: document.getElementById('fExit').value,
-    positionSize: document.getElementById('fSize').value,
-    fees: document.getElementById('fFees').value,
-    stopLoss: document.getElementById('fStopLoss').value,
-  };
-  const pnl = calcPnl(draft);
-  draft.pnl = pnl;
-  const r   = calcR(draft);
-  const el  = document.getElementById('pnlPreview');
-  el.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2) + (r !== null ? '  (' + (r >= 0 ? '+' : '') + r + 'R)' : '');
-  el.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-}
-['fTicker','fPosition','fEntry','fExit','fSize','fFees','fStopLoss'].forEach(id =>
-  document.getElementById(id).addEventListener('input', updatePnlPreview)
-);
-document.getElementById('fTicker').addEventListener('change', function() {
-  updateLeverageInfo(); updatePnlPreview();
-});
 
 document.getElementById('btnSubmitForm').addEventListener('click', () => {
   const ticker = document.getElementById('fTicker').value.trim().toUpperCase();
@@ -622,6 +562,8 @@ document.getElementById('btnSubmitForm').addEventListener('click', () => {
   if (+entry <= 0 || +exit <= 0) { showToast('Entry and Exit prices must be greater than 0.', 'error'); return; }
   if (+size <= 0) { showToast('Position size must be greater than 0.', 'error'); return; }
   if (+document.getElementById('fFees').value < 0) { showToast('Fees cannot be negative.', 'error'); return; }
+  const pnlVal = document.getElementById('fPnl').value;
+  if (pnlVal === '' || pnlVal === null) { showToast('Please enter the Net P&L.', 'error'); return; }
   const trade = {
     ticker, datetime: document.getElementById('fDatetime').value,
     position: document.getElementById('fPosition').value,
@@ -631,7 +573,7 @@ document.getElementById('btnSubmitForm').addEventListener('click', () => {
     tags: document.getElementById('fTags').value.trim(),
     notes: document.getElementById('fNotes').value.trim(),
   };
-  trade.pnl = calcPnl(trade);
+  trade.pnl = parseFloat(pnlVal) || 0;
   if (currentScreenshot) trade.screenshot = currentScreenshot;
   if (editId) {
     trades = trades.map(t => t.id === editId ? Object.assign({}, trade, { id: editId }) : t);
@@ -880,7 +822,7 @@ const ALL_TRADES_PAGE_SIZE = 50;
 function renderAllTrades() {
   var allTrades = accounts.reduce(function(arr, a) {
     var t = loadTrades(a.id);
-    t.forEach(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accId = a.id; tr._accName = a.name; });
+    t.forEach(function(tr) { tr._accId = a.id; tr._accName = a.name; });
     return arr.concat(t);
   }, []);
   var accSel = document.getElementById('allFilterAccount');
@@ -1116,7 +1058,7 @@ document.querySelectorAll('[data-notes-filter]').forEach(function(btn) {
 function renderAllNotes() {
   var allTrades = accounts.reduce(function(arr, a) {
     var t = loadTrades(a.id);
-    t.forEach(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accName = a.name; });
+    t.forEach(function(tr) { tr._accName = a.name; });
     return arr.concat(t);
   }, []);
   var list = allTrades.filter(function(t) { return t.notes && t.notes.trim(); });
@@ -1197,32 +1139,7 @@ function renderChart() {
 
 
 
-// ── Settings tab ─────────────────────────────────────────────
-function renderSettings() {
-  var acc = accounts.find(function(a) { return a.id === activeAccId; }) || {};
-  var fields = document.getElementById('leverageSettingsFields');
-  fields.innerHTML = CATEGORIES.map(function(cat) {
-    var val = getAccLeverage(acc, cat);
-    return '<div class="field"><label class="label">' + cat + '</label>' +
-      '<input class="input" type="number" min="1" id="lev_' + cat + '" value="' + val + '" placeholder="e.g. 500" /></div>';
-  }).join('');
-  var btn = document.getElementById('btnSaveLeverage');
-  btn.onclick = function() {
-    var leverageByCategory = {};
-    var valid = true;
-    CATEGORIES.forEach(function(cat) {
-      var v = parseFloat(document.getElementById('lev_' + cat).value);
-      if (!v || v <= 0) { valid = false; showToast('Enter a valid leverage for ' + cat, 'error'); }
-      leverageByCategory[cat] = v;
-    });
-    if (!valid) return;
-    accounts = accounts.map(function(a) {
-      return a.id === activeAccId ? Object.assign({}, a, { leverageByCategory: leverageByCategory }) : a;
-    });
-    saveAccounts(accounts);
-    showToast('Leverage saved!', 'success');
-  };
-}
+
 
 // ── Init ──────────────────────────────────────────────────────
 showScreen('overview');
