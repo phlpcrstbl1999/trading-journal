@@ -43,37 +43,53 @@ function esc(str) {
 }
 
 const ASSETS_KEY = 'tj_assets';
-const DEFAULT_ASSETS = [{ symbol: 'XAUUSD', contractSize: 100 }];
+const DEFAULT_ASSETS = [{ symbol: 'XAUUSD', category: 'Metals', contractSize: 100 }];
 
+let _assetsCache = null;
 function loadAssets() {
+  if (_assetsCache) return _assetsCache;
   var stored = localStorage.getItem(ASSETS_KEY);
-  if (!stored) return DEFAULT_ASSETS.slice();
+  if (!stored) { _assetsCache = DEFAULT_ASSETS.slice(); return _assetsCache; }
   var parsed = JSON.parse(stored);
-  // migrate old string-array format
-  if (parsed.length && typeof parsed[0] === 'string') {
-    return parsed.map(function(s) {
-      if (s === 'XAUUSD') return { symbol: 'XAUUSD', contractSize: 100 };
-      if (s.includes('XAG')) return { symbol: s, contractSize: 5000 };
-      return { symbol: s, contractSize: 1 };
-    });
-  }
-  return parsed;
+  _assetsCache = parsed.map(function(a) {
+    if (typeof a === 'string') {
+      if (a === 'XAUUSD') return { symbol: 'XAUUSD', category: 'Metals', contractSize: 100 };
+      if (a.includes('XAG')) return { symbol: a, category: 'Metals', contractSize: 5000 };
+      return { symbol: a, category: 'FX', contractSize: 1 };
+    }
+    if (!a.category) a.category = 'FX';
+    return { symbol: a.symbol, category: a.category, contractSize: a.contractSize || 1 };
+  });
+  return _assetsCache;
 }
-function saveAssets(list) { localStorage.setItem(ASSETS_KEY, JSON.stringify(list)); }
+function saveAssets(list) { _assetsCache = list; localStorage.setItem(ASSETS_KEY, JSON.stringify(list)); }
 
-const getContractSize = (ticker) => {
-  var list = loadAssets();
-  var found = list.find(function(a) { return a.symbol === (ticker || '').toUpperCase(); });
-  return found ? found.contractSize : 1;
+const getAsset = (ticker) => {
+  return loadAssets().find(function(a) { return a.symbol === (ticker || '').toUpperCase(); }) || {};
 };
+const getContractSize = (ticker) => getAsset(ticker).contractSize || 1;
 
-const calcPnl = (t, leverage) => {
+const CATEGORIES = ['FX', 'Indices', 'Metals', 'Oil', 'Crypto'];
+const DEFAULT_LEVERAGE = { FX: 500, Indices: 100, Metals: 100, Oil: 100, Crypto: 10 };
+
+function getAccLeverage(acc, category) {
+  var lev = acc && acc.leverageByCategory && acc.leverageByCategory[category];
+  return lev || DEFAULT_LEVERAGE[category] || 100;
+}
+
+const calcPnl = (t, accId) => {
   const entry = +t.entryPrice || 0, exit = +t.exitPrice || 0;
   const lots  = +t.positionSize || 0, fees = +t.fees || 0;
   const cs    = getContractSize(t.ticker);
-  const lev   = +leverage || 1;
-  const raw   = t.position === 'Long' ? (exit - entry) * lots * cs * lev : (entry - exit) * lots * cs * lev;
+  const raw   = t.position === 'Long' ? (exit - entry) * lots * cs : (entry - exit) * lots * cs;
   return parseFloat((raw - fees).toFixed(2));
+};
+
+const calcR = (t) => {
+  if (!t.stopLoss || !+t.stopLoss) return null;
+  const entry = +t.entryPrice, sl = +t.stopLoss;
+  const risk  = Math.abs(entry - sl) * (+t.positionSize || 0) * getContractSize(t.ticker);
+  return risk > 0 ? parseFloat((t.pnl / risk).toFixed(2)) : null;
 };
 
 const fmtMoney = (n) => {
@@ -102,6 +118,9 @@ const accountStats = (tradeList) => {
   const grossProfit = winList.reduce((a, t) => a + t.pnl, 0);
   const grossLoss   = Math.abs(lossList.reduce((a, t) => a + t.pnl, 0));
   const profitFactor = grossLoss > 0 ? parseFloat((grossProfit / grossLoss).toFixed(2)) : grossProfit > 0 ? Infinity : 0;
+  // avg R
+  const rList = tradeList.map(t => calcR(t)).filter(r => r !== null);
+  const avgR  = rList.length ? parseFloat((rList.reduce((a, r) => a + r, 0) / rList.length).toFixed(2)) : null;
   // max drawdown
   const sorted = tradeList.slice().sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
   let peak = 0, cum = 0, maxDD = 0;
@@ -114,7 +133,7 @@ const accountStats = (tradeList) => {
     else if ((streakType === 'W') === isWin) streak++;
     else break;
   }
-  return { totalPnl: parseFloat(totalPnl.toFixed(2)), winRate: parseFloat(((winList.length / tradeList.length) * 100).toFixed(1)), wins: winList.length, losses: lossList.length, total: tradeList.length, best, worst, avgWin: parseFloat(avgWin.toFixed(2)), avgLoss: parseFloat(avgLoss.toFixed(2)), profitFactor, maxDrawdown: parseFloat(maxDD.toFixed(2)), streak, streakType };
+  return { totalPnl: parseFloat(totalPnl.toFixed(2)), winRate: parseFloat(((winList.length / tradeList.length) * 100).toFixed(1)), wins: winList.length, losses: lossList.length, total: tradeList.length, best, worst, avgWin: parseFloat(avgWin.toFixed(2)), avgLoss: parseFloat(avgLoss.toFixed(2)), profitFactor, avgR, maxDrawdown: parseFloat(maxDD.toFixed(2)), streak, streakType };
 };
 
 // ── Toast ────────────────────────────────────────────────────
@@ -133,32 +152,46 @@ function populateAssetSelect(selected) {
   var list = loadAssets();
   var sel  = document.getElementById('fTicker');
   sel.innerHTML = list.map(function(a) {
-    return '<option value="' + esc(a.symbol) + '"' + (a.symbol === selected ? ' selected' : '') + '>' + esc(a.symbol) + '</option>';
+    return '<option value="' + esc(a.symbol) + '"' + (a.symbol === selected ? ' selected' : '') + '>' +
+      esc(a.symbol) + ' (' + esc(a.category || 'FX') + ')' +
+    '</option>';
   }).join('');
+  updateLeverageInfo();
 }
 
 var addAssetBackdrop = document.getElementById('addAssetModalBackdrop');
-function openAddAssetModal() {
-  document.getElementById('fNewAssetSymbol').value = '';
-  document.getElementById('fNewAssetContractSize').value = '';
+function openAddAssetModal(asset) {
+  document.getElementById('addAssetModalTitle').textContent = asset ? 'Edit Asset' : 'Add Asset';
+  document.getElementById('fNewAssetSymbol').value = asset ? asset.symbol : '';
+  document.getElementById('fNewAssetSymbol').readOnly = !!asset;
+  document.getElementById('fNewAssetCategory').value = asset ? (asset.category || 'FX') : 'FX';
+  document.getElementById('fNewAssetContractSize').value = asset ? (asset.contractSize || '') : '';
   addAssetBackdrop.classList.remove('hidden');
-  setTimeout(function() { document.getElementById('fNewAssetSymbol').focus(); }, 50);
+  setTimeout(function() { document.getElementById(asset ? 'fNewAssetContractSize' : 'fNewAssetSymbol').focus(); }, 50);
 }
-function closeAddAssetModal() { addAssetBackdrop.classList.add('hidden'); }
+function closeAddAssetModal() { document.getElementById('fNewAssetSymbol').readOnly = false; addAssetBackdrop.classList.add('hidden'); }
 document.getElementById('btnCloseAddAssetModal').addEventListener('click', closeAddAssetModal);
 document.getElementById('btnCancelAddAsset').addEventListener('click', closeAddAssetModal);
 addAssetBackdrop.addEventListener('click', function(e) { if (e.target === addAssetBackdrop) closeAddAssetModal(); });
 document.getElementById('btnSaveAddAsset').addEventListener('click', function() {
   var sym = document.getElementById('fNewAssetSymbol').value.trim().toUpperCase();
+  var cat = document.getElementById('fNewAssetCategory').value;
   var cs  = parseFloat(document.getElementById('fNewAssetContractSize').value);
   if (!sym) { showToast('Please enter an asset symbol.', 'error'); return; }
   if (!cs || cs <= 0) { showToast('Please enter a valid contract size.', 'error'); return; }
   var list = loadAssets();
-  if (!list.find(function(a) { return a.symbol === sym; })) { list.push({ symbol: sym, contractSize: cs }); saveAssets(list); }
+  var idx = list.findIndex(function(a) { return a.symbol === sym; });
+  var asset = { symbol: sym, category: cat, contractSize: cs };
+  if (idx >= 0) list[idx] = asset; else list.push(asset);
+  saveAssets(list);
   populateAssetSelect(sym);
   closeAddAssetModal();
 });
-document.getElementById('btnAddAsset').addEventListener('click', openAddAssetModal);
+document.getElementById('btnAddAsset').addEventListener('click', function() {
+  var ticker = document.getElementById('fTicker').value;
+  var existing = ticker ? getAsset(ticker) : null;
+  openAddAssetModal(existing && existing.symbol ? existing : null);
+});
 
 // ── Screenshot helpers ────────────────────────────────────────
 function setScreenshotPreview(src) {
@@ -217,6 +250,22 @@ document.getElementById('lightboxClose').addEventListener('click', () => documen
 document.getElementById('lightbox').addEventListener('click', (e) => { if (e.target === document.getElementById('lightbox')) document.getElementById('lightbox').classList.add('hidden'); });
 
 // ── Screen switching ──────────────────────────────────────────
+let currentAccountTab = 'dashboard';
+
+function switchAccountTab(tab) {
+  currentAccountTab = tab;
+  document.querySelectorAll('.acc-tab-panel').forEach(p => p.style.display = 'none');
+  document.getElementById('tab-' + tab).style.display = 'block';
+  document.querySelectorAll('[data-sidebar-acctab]').forEach(b => b.classList.toggle('active', b.dataset.acctab === tab));
+  // also update desktop nav if present
+  document.querySelectorAll('[data-accnavtab]').forEach(b => b.classList.toggle('active', b.dataset.accnavtab === tab));
+  if (tab === 'dashboard') renderDashboard();
+  else if (tab === 'trades') renderTrades();
+  else if (tab === 'notes') renderNotes();
+  else if (tab === 'withdrawals') renderWithdrawals();
+  else if (tab === 'settings') renderSettings();
+}
+
 function showScreen(name) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById('screen-' + name).classList.add('active');
@@ -224,7 +273,14 @@ function showScreen(name) {
   const overviewNav = document.getElementById('overviewNav');
   const btnAdd      = document.getElementById('btnOpenForm');
 
+  // Toggle sidebar panels
+  document.getElementById('sidebarOverviewTabs').style.display = name === 'overview' ? 'flex' : 'none';
+  document.getElementById('sidebarAccountTabs').style.display  = name === 'account'  ? 'flex' : 'none';
+  document.getElementById('sidebarOverviewTabs').style.flexDirection = 'column';
+  document.getElementById('sidebarAccountTabs').style.flexDirection  = 'column';
+
   if (name === 'overview') {
+    activeAccId = null; trades = []; withdrawals = [];
     overviewNav.style.display = 'none';
     btnAdd.style.display = 'none';
     document.getElementById('btnLogWithdrawal').style.display = 'none';
@@ -232,29 +288,34 @@ function showScreen(name) {
   } else {
     var accObj   = accounts.find(a => a.id === activeAccId) || {};
     var accLabel = esc(accObj.name) + (accObj.step ? ' — ' + esc(accObj.step) : '');
+    // Desktop nav for account
     overviewNav.innerHTML =
       '<button class="back-btn" id="btnBack">' +
       '<svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>' +
       'Accounts</button>' +
-      '<span class="account-label" style="margin-left:8px">' + accLabel + '</span>';
+      '<span class="account-label" style="margin-left:8px">' + accLabel + '</span>' +
+      '<div style="display:flex;gap:4px;margin-left:12px">' +
+        ['dashboard','trades','notes','withdrawals','settings'].map(t =>
+          '<button class="tab-btn' + (t === currentAccountTab ? ' active' : '') + '" data-accnavtab="' + t + '">' +
+          t.charAt(0).toUpperCase() + t.slice(1) + '</button>'
+        ).join('') +
+      '</div>';
     overviewNav.style.display = 'flex';
     overviewNav.style.alignItems = 'center';
     overviewNav.style.gap = '8px';
+    overviewNav.querySelectorAll('[data-accnavtab]').forEach(function(btn) {
+      btn.addEventListener('click', function() { switchAccountTab(btn.dataset.accnavtab); });
+    });
     btnAdd.style.display = 'flex';
     document.getElementById('btnOpenFormLabel').textContent = 'Log Trade';
-    var accObj2 = accounts.find(a => a.id === activeAccId) || {};
-    var canW = ['Funded','Live','Instant'].indexOf(accObj2.type) !== -1;
-    var btnW = document.getElementById('btnLogWithdrawal');
-    if (canW) {
-      btnW.style.display = 'flex';
-    } else {
-      btnW.style.display = 'none';
-    }
+    var canW = ['Funded','Live','Instant'].indexOf(accObj.type) !== -1;
+    document.getElementById('btnLogWithdrawal').style.display = canW ? 'flex' : 'none';
     document.getElementById('btnBack').addEventListener('click', () => {
       activeAccId = null; trades = [];
       showScreen('overview');
     });
-    renderDashboard();
+    currentAccountTab = 'dashboard';
+    switchAccountTab('dashboard');
   }
 }
 
@@ -325,7 +386,6 @@ function openAccountModal(acc) {
   document.getElementById('fAccStep').value     = acc ? (acc.step || 'Step 1') : 'Step 1';
   document.getElementById('fAccStepWrap').style.display = (acc && acc.type === 'Challenge') ? 'flex' : 'none';
   document.getElementById('fAccSize').value     = acc ? (acc.size || '') : '';
-  document.getElementById('fAccLeverage').value = acc ? (acc.leverage || '') : '';
   accBackdrop.classList.remove('hidden');
 }
 
@@ -347,7 +407,6 @@ document.getElementById('btnSaveAccount').addEventListener('click', () => {
     type:     type,
     step:     type === 'Challenge' ? document.getElementById('fAccStep').value : null,
     size:     parseFloat(document.getElementById('fAccSize').value) || 0,
-    leverage: parseFloat(document.getElementById('fAccLeverage').value) || 1,
   };
   if (editAccId) {
     accounts = accounts.map(a => a.id === editAccId ? Object.assign({}, a, data) : a);
@@ -365,8 +424,12 @@ function renderOverview() {
   Object.values(miniCharts).forEach(c => c.destroy());
   miniCharts = {};
 
-  // Combined KPIs across all accounts
-  const allTrades = accounts.reduce((arr, a) => arr.concat(loadTrades(a.id)), []);
+  // recalculate pnl for all trades before stats
+  const allTrades = accounts.reduce((arr, a) => {
+    const t = loadTrades(a.id).map(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accId = a.id; return tr; });
+    saveTrades(a.id, t);
+    return arr.concat(t);
+  }, []);
   const cs = accountStats(allTrades);
   const pnlColor = cs.totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
   const allWithdrawn = accounts.reduce(function(sum, a) {
@@ -385,7 +448,7 @@ function renderOverview() {
     return;
   }
   grid.innerHTML = accounts.map(acc => {
-    const t   = loadTrades(acc.id);
+    const t   = allTrades.filter(function(tr) { return tr._accId === acc.id; });
     const w   = loadWithdrawals(acc.id);
     const s   = accountStats(t);
     const pc  = s.totalPnl >= 0 ? 'var(--green)' : 'var(--red)';
@@ -425,7 +488,7 @@ function renderOverview() {
 
   // Draw mini charts
   accounts.forEach(acc => {
-    const t = loadTrades(acc.id);
+    const t = allTrades.filter(function(tr) { return tr._accId === acc.id; });
     if (t.length < 2) return;
     const sorted = [...t].sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
     let cum = 0;
@@ -475,7 +538,8 @@ function renderOverview() {
 
 function openAccount(id) {
   activeAccId = id;
-  trades      = loadTrades(id);
+  trades      = loadTrades(id).map(function(t) { t.pnl = calcPnl(t); return t; });
+  saveTrades(id, trades);
   withdrawals = loadWithdrawals(id);
   filterResult = 'all'; filterAsset = ''; sortField = 'datetime'; sortDir = 'desc'; notesFilter = 'all'; calYear = 0; calMonth = 0;
   showScreen('account');
@@ -496,6 +560,7 @@ function openModal(trade) {
   document.getElementById('fExit').value     = trade ? trade.exitPrice    : '';
   document.getElementById('fSize').value     = trade ? trade.positionSize : '';
   document.getElementById('fFees').value     = trade ? trade.fees         : '0';
+  document.getElementById('fStopLoss').value = trade ? (trade.stopLoss || '') : '';
   document.getElementById('fTags').value     = trade ? trade.tags         : '';
   document.getElementById('fNotes').value    = trade ? trade.notes        : '';
   currentScreenshot = (trade && trade.screenshot) ? trade.screenshot : null;
@@ -506,11 +571,23 @@ function openModal(trade) {
 
 function closeModal() { backdrop.classList.add('hidden'); editId = null; }
 
-document.getElementById('btnOpenForm').addEventListener('click', () => { if (activeAccId) openModal(); });
+document.getElementById('btnOpenForm').addEventListener('click', () => {
+  if (!activeAccId) { showToast('Open an account first.', 'error'); return; }
+  openModal();
+});
 document.getElementById('btnLogWithdrawal').addEventListener('click', () => { if (activeAccId) openWithdrawalModal(); });
 document.getElementById('btnCloseModal').addEventListener('click', closeModal);
 document.getElementById('btnCancelForm').addEventListener('click', closeModal);
 backdrop.addEventListener('click', (e) => { if (e.target === backdrop) closeModal(); });
+
+function updateLeverageInfo() {
+  var ticker = document.getElementById('fTicker').value;
+  var asset = getAsset(ticker);
+  var acc = accounts.find(function(a) { return a.id === activeAccId; }) || {};
+  var lev = getAccLeverage(acc, asset.category || 'FX');
+  var el = document.getElementById('leverageInfo');
+  if (el) el.textContent = asset.category ? asset.category + ' · Leverage 1:' + lev : '';
+}
 
 function updatePnlPreview() {
   const draft = {
@@ -520,16 +597,21 @@ function updatePnlPreview() {
     exitPrice: document.getElementById('fExit').value,
     positionSize: document.getElementById('fSize').value,
     fees: document.getElementById('fFees').value,
+    stopLoss: document.getElementById('fStopLoss').value,
   };
-  const acc = accounts.find(function(a) { return a.id === activeAccId; }) || {};
-  const pnl = calcPnl(draft, acc.leverage || 1);
+  const pnl = calcPnl(draft);
+  draft.pnl = pnl;
+  const r   = calcR(draft);
   const el  = document.getElementById('pnlPreview');
-  el.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+  el.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2) + (r !== null ? '  (' + (r >= 0 ? '+' : '') + r + 'R)' : '');
   el.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
 }
-['fTicker','fPosition','fEntry','fExit','fSize','fFees'].forEach(id =>
+['fTicker','fPosition','fEntry','fExit','fSize','fFees','fStopLoss'].forEach(id =>
   document.getElementById(id).addEventListener('input', updatePnlPreview)
 );
+document.getElementById('fTicker').addEventListener('change', function() {
+  updateLeverageInfo(); updatePnlPreview();
+});
 
 document.getElementById('btnSubmitForm').addEventListener('click', () => {
   const ticker = document.getElementById('fTicker').value.trim().toUpperCase();
@@ -545,11 +627,11 @@ document.getElementById('btnSubmitForm').addEventListener('click', () => {
     position: document.getElementById('fPosition').value,
     entryPrice: entry, exitPrice: exit, positionSize: size,
     fees: document.getElementById('fFees').value || '0',
+    stopLoss: document.getElementById('fStopLoss').value || '',
     tags: document.getElementById('fTags').value.trim(),
     notes: document.getElementById('fNotes').value.trim(),
   };
-  const acc2 = accounts.find(a => a.id === activeAccId) || {};
-  trade.pnl = calcPnl(trade, acc2.leverage || 1);
+  trade.pnl = calcPnl(trade);
   if (currentScreenshot) trade.screenshot = currentScreenshot;
   if (editId) {
     trades = trades.map(t => t.id === editId ? Object.assign({}, trade, { id: editId }) : t);
@@ -563,7 +645,9 @@ document.getElementById('btnSubmitForm').addEventListener('click', () => {
     showToast('💾 ' + totalSaved + ' trades logged — consider exporting a backup!', 'success');
   }
   closeModal();
-  renderDashboard();
+  if (currentAccountTab === 'trades') renderTrades();
+  else if (currentAccountTab === 'notes') renderNotes();
+  else renderDashboard();
 });
 
 // ── Dashboard ─────────────────────────────────────────────────
@@ -571,6 +655,112 @@ function renderDashboard() {
   renderKpis();
   renderCalendar();
   renderChart();
+}
+
+// ── Account Trades tab ────────────────────────────────────────
+function renderTrades() {
+  var assets = [...new Set(trades.map(t => t.ticker))].sort();
+  var sel = document.getElementById('filterAsset');
+  var prev = sel.value;
+  sel.innerHTML = '<option value="">All Assets</option>' +
+    assets.map(a => '<option' + (a === prev ? ' selected' : '') + '>' + esc(a) + '</option>').join('');
+  var list = trades.slice();
+  if (filterResult === 'win')  list = list.filter(t => t.pnl > 0);
+  if (filterResult === 'loss') list = list.filter(t => t.pnl <= 0);
+  if (filterAsset) list = list.filter(t => t.ticker === filterAsset);
+  list.sort(function(a, b) {
+    var av = a[sortField], bv = b[sortField];
+    if (sortField === 'datetime') { av = new Date(av); bv = new Date(bv); }
+    else { av = +av || 0; bv = +bv || 0; }
+    return sortDir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
+  });
+  document.getElementById('tradeCount').textContent = list.length + ' trade' + (list.length !== 1 ? 's' : '');
+  var tbody = document.getElementById('tradesTbody');
+  if (!list.length) { tbody.innerHTML = '<tr class="empty-row"><td colspan="10">No trades found.</td></tr>'; return; }
+  // sortable headers
+  document.querySelectorAll('#tradesTable th[data-sort]').forEach(function(th) {
+    th.classList.toggle('sort-asc', sortField === th.dataset.sort && sortDir === 'asc');
+    th.classList.toggle('sort-desc', sortField === th.dataset.sort && sortDir === 'desc');
+    th.onclick = function() {
+      if (sortField === th.dataset.sort) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortField = th.dataset.sort; sortDir = th.dataset.sort === 'datetime' ? 'desc' : 'desc'; }
+      renderTrades();
+    };
+  });
+  tbody.innerHTML = list.map(function(t) {
+    var pc = t.pnl >= 0 ? 'green' : 'red';
+    var sc = t.position === 'Long' ? 'badge-long' : 'badge-short';
+    var r  = calcR(t);
+    var pnlCell = (t.pnl >= 0 ? '+' : '') + '$' + Math.abs(t.pnl).toFixed(2) + (r !== null ? '<span style="color:var(--muted);font-size:.72rem;margin-left:4px">(' + (r >= 0 ? '+' : '') + r + 'R)</span>' : '');
+    var tags = t.tags ? t.tags.split(',').map(g => '<span class="tag-chip">' + esc(g.trim()) + '</span>').join('') : '<span class="muted">—</span>';
+    var thumb = t.screenshot ? '<img class="thumb" src="' + t.screenshot + '" data-src="' + t.screenshot + '" alt="chart" />' : '<span class="muted">—</span>';
+    return '<tr>' +
+      '<td style="color:var(--muted);font-size:.78rem">' + fmtDate(t.datetime) + '</td>' +
+      '<td class="fw7">' + esc(t.ticker) + '</td>' +
+      '<td><span class="badge ' + sc + '">' + esc(t.position) + '</span></td>' +
+      '<td>$' + parseFloat(t.entryPrice).toLocaleString() + '</td>' +
+      '<td>$' + parseFloat(t.exitPrice).toLocaleString() + '</td>' +
+      '<td style="color:var(--muted)">' + esc(String(t.positionSize)) + '</td>' +
+      '<td class="' + pc + ' fw7">' + pnlCell + '</td>' +
+      '<td class="hide-sm">' + tags + '</td>' +
+      '<td class="hide-sm">' + thumb + '</td>' +
+      '<td><div class="action-btns">' +
+        '<button class="action-btn edit" data-edit-id="' + esc(t.id) + '" title="Edit"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>' +
+        '<button class="action-btn del" data-del-id="' + esc(t.id) + '" title="Delete"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg></button>' +
+      '</div></td>' +
+    '</tr>';
+  }).join('');
+  tbody.querySelectorAll('.thumb').forEach(img => img.addEventListener('click', () => openLightbox(img.dataset.src)));
+  tbody.querySelectorAll('[data-edit-id]').forEach(btn => btn.addEventListener('click', () => {
+    var trade = trades.find(t => t.id === btn.dataset.editId); if (trade) openModal(trade);
+  }));
+  tbody.querySelectorAll('[data-del-id]').forEach(btn => btn.addEventListener('click', () => {
+    showConfirm('Delete Trade', 'Delete this trade? This cannot be undone.', function() {
+      trades = trades.filter(t => t.id !== btn.dataset.delId);
+      saveTrades(activeAccId, trades); renderTrades();
+    });
+  }));
+}
+
+document.getElementById('filterAsset').addEventListener('change', function(e) { filterAsset = e.target.value; renderTrades(); });
+document.querySelectorAll('[data-result]').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    document.querySelectorAll('[data-result]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active'); filterResult = btn.dataset.result; renderTrades();
+  });
+});
+
+// ── Account Withdrawals tab ───────────────────────────────────
+function renderWithdrawals() {
+  var total = withdrawals.reduce(function(s, w) { return s + w.amount; }, 0);
+  document.getElementById('withdrawalSummary').innerHTML =
+    '<div class="card kpi-card" style="max-width:260px">' +
+    '<div class="kpi-icon" style="background:#e3b34122">' + withdrawIcon() + '</div>' +
+    '<div><div class="kpi-label">Total Withdrawn</div>' +
+    '<div class="kpi-value" style="color:var(--yellow)">' + fmtMoney(total) + '</div>' +
+    '<div class="kpi-sub">' + withdrawals.length + ' withdrawal' + (withdrawals.length !== 1 ? 's' : '') + '</div></div></div>';
+  var listEl = document.getElementById('withdrawalList');
+  if (!withdrawals.length) {
+    listEl.innerHTML = '<div class="card" style="text-align:center;color:var(--muted);padding:40px;font-size:.85rem">No withdrawals yet.</div>';
+    return;
+  }
+  var sorted = withdrawals.slice().sort(function(a, b) { return new Date(b.date) - new Date(a.date); });
+  var rows = sorted.map(function(w) {
+    var d = new Date(w.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    return '<tr><td style="color:var(--muted);font-size:.78rem">' + d + '</td>' +
+      '<td class="fw7" style="color:var(--yellow)">-$' + w.amount.toFixed(2) + '</td>' +
+      '<td style="color:var(--muted)">' + (w.note || '—') + '</td>' +
+      '<td><button class="action-btn del" data-del-w-id="' + esc(w.id) + '" title="Delete"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg></button></td></tr>';
+  }).join('');
+  listEl.innerHTML = '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Amount</th><th>Note</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  listEl.querySelectorAll('[data-del-w-id]').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      showConfirm('Delete Withdrawal', 'Delete this withdrawal?', function() {
+        withdrawals = withdrawals.filter(w => w.id !== btn.dataset.delWId);
+        saveWithdrawals(activeAccId, withdrawals); renderWithdrawals(); renderKpis();
+      });
+    });
+  });
 }
 
 let calYear = 0, calMonth = 0;
@@ -619,6 +809,7 @@ function renderCalendar() {
     if (pnl !== undefined) cls += pnl >= 0 ? ' win' : ' loss';
     html += '<div class="' + cls + '">' +
       '<span class="cal-day-num">' + day + '</span>' +
+      (countMap[key] ? '<span class="cal-day-count">' + countMap[key] + ' trade' + (countMap[key] > 1 ? 's' : '') + '</span>' : '') +
       (pnl !== undefined ? '<span class="cal-day-pnl">' + (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2) + '</span>' : '') +
     '</div>';
   }
@@ -648,13 +839,22 @@ function renderKpis() {
   const canWithdraw = ['Funded','Live','Instant'].indexOf(acc.type) !== -1;
   const totalWithdrawn = withdrawals.reduce(function(sum, w) { return sum + w.amount; }, 0);
   const netBalance = s.totalPnl - totalWithdrawn;
+  const pfColor = s.profitFactor >= 1.5 ? 'var(--green)' : s.profitFactor >= 1 ? 'var(--yellow)' : 'var(--red)';
+  const streakColor = s.streakType === 'W' ? 'var(--green)' : 'var(--red)';
+  const streakLabel = s.streak ? s.streak + ' ' + (s.streakType === 'W' ? 'Win' : 'Loss') + (s.streak > 1 ? 's' : '') : '—';
   grid.innerHTML =
     kpiCard('Total P&L', '<span style="color:' + pc + '">' + fmtMoney(s.totalPnl) + '</span>', '', '#388bfd', trendIcon(s.totalPnl >= 0)) +
     kpiCard('Win Rate', s.winRate + '%', s.wins + 'W / ' + s.losses + 'L', '#26a641', targetIcon()) +
     kpiCard('Total Trades', s.total, '', '#e3b341', barIcon()) +
     (canWithdraw
       ? kpiCard('Withdrawn', '<span style="color:var(--yellow)">' + fmtMoney(totalWithdrawn) + '</span>', 'Net: <span style="color:' + (netBalance >= 0 ? 'var(--green)' : 'var(--red)') + '">' + fmtMoney(netBalance) + '</span>', '#e3b341', withdrawIcon())
-      : kpiCard('Best / Worst', '<span class="green">' + fmtMoney(s.best) + '</span>', 'Worst: <span class="red">' + fmtMoney(s.worst) + '</span>', '#26a641', trendIcon(true)));
+      : kpiCard('Best / Worst', '<span class="green">' + fmtMoney(s.best) + '</span>', 'Worst: <span class="red">' + fmtMoney(s.worst) + '</span>', '#26a641', trendIcon(true))) +
+    kpiCard('Profit Factor', '<span style="color:' + pfColor + '">' + (s.profitFactor === Infinity ? '∞' : s.profitFactor) + '</span>', '', '#388bfd', targetIcon()) +
+    kpiCard('Avg Win', '<span class="green">+$' + s.avgWin.toFixed(2) + '</span>', 'Avg Loss: <span class="red">-$' + s.avgLoss.toFixed(2) + '</span>', '#26a641', trendIcon(true)) +
+    kpiCard('Max Drawdown', '<span class="red">-$' + s.maxDrawdown.toFixed(2) + '</span>', '', '#f85149', trendIcon(false)) +
+    (s.avgR !== null
+      ? kpiCard('Avg R', '<span style="color:' + (s.avgR >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (s.avgR >= 0 ? '+' : '') + s.avgR + 'R</span>', 'Current Streak: <span style="color:' + streakColor + '">' + streakLabel + '</span>', '#e3b341', barIcon())
+      : kpiCard('Current Streak', '<span style="color:' + streakColor + '">' + streakLabel + '</span>', '', '#e3b341', barIcon()));
 }
 
 function kpiCard(label, value, sub, color, icon) {
@@ -680,7 +880,7 @@ const ALL_TRADES_PAGE_SIZE = 50;
 function renderAllTrades() {
   var allTrades = accounts.reduce(function(arr, a) {
     var t = loadTrades(a.id);
-    t.forEach(function(tr) { tr._accId = a.id; tr._accName = a.name; });
+    t.forEach(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accId = a.id; tr._accName = a.name; });
     return arr.concat(t);
   }, []);
   var accSel = document.getElementById('allFilterAccount');
@@ -916,7 +1116,7 @@ document.querySelectorAll('[data-notes-filter]').forEach(function(btn) {
 function renderAllNotes() {
   var allTrades = accounts.reduce(function(arr, a) {
     var t = loadTrades(a.id);
-    t.forEach(function(tr) { tr._accName = a.name; });
+    t.forEach(function(tr) { tr.pnl = calcPnl(tr, a.id); tr._accName = a.name; });
     return arr.concat(t);
   }, []);
   var list = allTrades.filter(function(t) { return t.notes && t.notes.trim(); });
@@ -956,6 +1156,7 @@ document.getElementById('btnSaveWithdrawal').addEventListener('click', function(
   saveWithdrawals(activeAccId, withdrawals);
   closeWithdrawalModal();
   renderKpis();
+  if (currentAccountTab === 'withdrawals') renderWithdrawals();
 });
 
 function renderChart() {
@@ -996,5 +1197,32 @@ function renderChart() {
 
 
 
+// ── Settings tab ─────────────────────────────────────────────
+function renderSettings() {
+  var acc = accounts.find(function(a) { return a.id === activeAccId; }) || {};
+  var fields = document.getElementById('leverageSettingsFields');
+  fields.innerHTML = CATEGORIES.map(function(cat) {
+    var val = getAccLeverage(acc, cat);
+    return '<div class="field"><label class="label">' + cat + '</label>' +
+      '<input class="input" type="number" min="1" id="lev_' + cat + '" value="' + val + '" placeholder="e.g. 500" /></div>';
+  }).join('');
+  var btn = document.getElementById('btnSaveLeverage');
+  btn.onclick = function() {
+    var leverageByCategory = {};
+    var valid = true;
+    CATEGORIES.forEach(function(cat) {
+      var v = parseFloat(document.getElementById('lev_' + cat).value);
+      if (!v || v <= 0) { valid = false; showToast('Enter a valid leverage for ' + cat, 'error'); }
+      leverageByCategory[cat] = v;
+    });
+    if (!valid) return;
+    accounts = accounts.map(function(a) {
+      return a.id === activeAccId ? Object.assign({}, a, { leverageByCategory: leverageByCategory }) : a;
+    });
+    saveAccounts(accounts);
+    showToast('Leverage saved!', 'success');
+  };
+}
+
 // ── Init ──────────────────────────────────────────────────────
-showscreen('overview');
+showScreen('overview');
